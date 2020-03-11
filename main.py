@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 import lib
 from lib.util import progress_bar
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset name(cifar10, cifar100).')
@@ -26,7 +27,9 @@ def parse_args():
     parser.add_argument('--batchsize', type=int, default=256, help='Batchsize of dataloader.')
     parser.add_argument('--expansion', type=float, default=1.0, help='The expansion ratio for the model.')
     parser.add_argument('--ratio', type=float, default=0.5, help='The prune ratio used in sparsity regularzation.')
+    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate for weight training.')
     return parser.parse_args()
+
 
 def prepare_data(args):
     cifar_train_trans = transforms.Compose([
@@ -53,15 +56,16 @@ def prepare_data(args):
 
 
 def regularzation_update(model, args):
-    if not args.sum_channal:
-        args.sum_channal = 0
+    if not args.sum_channel:
+        args.sum_channel = 0
         for layer in model.modules():
             if isinstance(layer, nn.BatchNorm2d):
-                args.sum_channal += layer.weight.size()[0]
-    sumc = args.sum_channal
+                args.sum_channel += layer.weight.size()[0]
+    sumc = args.sum_channel
     for layer in model.modules():
         if isinstance(layer, nn.BatchNorm2d):
             layer.weight.grad.data.add(2.0 * torch.sign(layer.weight.data)*(layer.weight.data/sumc-args.ratio))
+
 
 def arch_train(model, args, train_loader, val_loader):
     '''First Train the architecture parameters without updating the other weights'''
@@ -102,14 +106,15 @@ def arch_train(model, args, train_loader, val_loader):
             progress_bar(batchid, len(train_loader), 'Loss: %.3f | Acc: %.3f'% (avg_loss, acc))
         
             
-def weight_train(model, args):
-    pass
-
 def binary_search(model, gates, args):
+    # TODO: use binary search to find the threshold for the pruning
     pos = int(len(gates) * args.ratio)
     return gates[pos]
 
+
 def prune(model, args):
+    if not os.path.exists(args.outdir):
+        os.makedirs(args.outdir)
     print('Pruning the network according to the architecture parameters.')
     gates = torch.zeros(args.sum_channel)
     index = 0
@@ -124,19 +129,98 @@ def prune(model, args):
     threshold = binary_search(model, gates, args)
     for lid, layer in enumerate(model.modules()):
         if isinstance(layer, nn.BatchNorm2d):
+            weight_copy = layer.weight.data.abs().clone()
+            mask = weight_copy.gt(threshold)
+            mask = mask.float().cuda()
+            layer.weight.data.mul_(mask)
+            layer.bias.data.mul_(mask)
+            pruned += mask.shape[0] - sum(mask)
+            cfg.append(torch.sum(mask).item())
+            cfg_mask.append(mask)
+        elif isinstance(layer, nn.MaxPool2d):
+            cfg.append('M')
+    print('Original channel number: ',args.sum_channel)
+    print(cfg)
+    print('After pruned channel number: ', sum(filter(lambda x:isinstance(x,int), cfg)))
+    new_model = models.__dict__[args.model](args.num_class, cfg=cfg)
+    logfile = os.path.join(args.outdir, 'log.txt')
+    with open(logfile, 'w') as logf:
+        logf.write('Configuration of the pruned model\n')
+        logf.write(str(cfg))
+    return new_model
+
+
+def validation(model, val_loader, criterion, Use_Cuda):
+    model.eval()
+    test_loss = 0.0
+    correct = 0
+    total = 0
+    for batchid, (data, target) in enumerate(val_loader):
+        if Use_Cuda:
+            data, target = data.cuda(), target.cuda()
+        output = model(data)
+        loss = criterion(output, target)
+        test_loss += loss
+        _, predicted = output.max(1)
+        total += target.size(0)
+        correct += predicted.eq(target).sum().item()
+        avg_acc = correct / total
+        avg_loss = test_loss / (batchid + 1)
+        progress_bar(batchid, len(val_loader), 'Loss: %.3f | Acc: %.3f' % (avg_loss, avg_acc))
+    return correct/total
+
+
+def weight_train(model, train_loader, val_loader, args):
+    best_acc = 0.0
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    for i in range(args.wepoch):
+        print('==>Epoch %d' % (i+1))
+        print('==>Training')
+        model.train()
+        train_loss = 0.0
+        correct = 0
+        total = 0
+        for batchid, (data, target) in enumerate(train_loader):
+            if args.Use_Cuda:
+                data, target = data.cuda(), target.cuda()
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
             
+            train_loss += loss.item()
+            _, predicted = output.max(1)
+            total += output.size(0)
+            correct += predicted.eq(target).sum().item()
+            avg_loss = train_loss / (batchid + 1)
+            avg_acc = correct / total
+            progress_bar(batchid, len(train_loader), 'Loss: %.3f | Acc: %.3f' % (avg_loss, avg_acc))
+        # Validation
+        print('==>Validating')
+        val_acc = validation(model, val_loader, criterion, args.Use_Cuda)    
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_checkpoint = {'state_dict':model.state_dict(), 'Acc':best_acc}
+            fname = os.path.join(args.outdir, 'best.pth.tar')
+            torch.save(best_checkpoint, fname)
+        print('==>Best validation accuracy', best_acc)
+        # Save checkpoint
+        torch.save(model.state_dict(), os.path.join(args.outdir, 'checkpoint.pth.tar')) 
 
 def main():
     args = parse_args()
     train_loader, val_loader = prepare_data(args)
-    num_class = 10 if args.dataset == 'cifar10' else 100
-    model = models.__dict__[args.model](num_classes=num_class, expansion=args.expansion)
+    args.num_class = 10 if args.dataset == 'cifar10' else 100
+    model = models.__dict__[args.model](num_classes=args.num_class, expansion=args.expansion)
     args.Use_Cuda = torch.cuda.is_available()
-    args.sum_channal = None
+    args.sum_channel = None
     if args.Use_Cuda:
         model.cuda()
     arch_train(model, args, train_loader, val_loader)
     new_model = prune(model, args)
-
+    weight_train(new_model, train_loader, val_loader, args)
+    
 if __name__ == '__main__':
     main()
