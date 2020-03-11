@@ -23,11 +23,12 @@ def parse_args():
     parser.add_argument('--aepoch', type=int, default=10, help='The number of epochs for arch learning.')
     parser.add_argument('--wepoch', type=int, default=200, help='The number of epochs for weight learning.')
     parser.add_argument('--alr', type=float, default=0.1, help='Learning rate of the architecture learning.')
-    parser.add_argument('--wlr', type=float, default=0.01, help='Learing rate of the weight learning.')
     parser.add_argument('--batchsize', type=int, default=256, help='Batchsize of dataloader.')
     parser.add_argument('--expansion', type=float, default=1.0, help='The expansion ratio for the model.')
     parser.add_argument('--ratio', type=float, default=0.5, help='The prune ratio used in sparsity regularzation.')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate for weight training.')
+    parser.add_argument('--lr_decay', action='store_true', default=False, help='If use the learning rate decay.')
+    parser.add_argument('--balance', type=float, default=0.5, help='The balance constant of the sparsity regularization.')
     return parser.parse_args()
 
 
@@ -64,7 +65,7 @@ def regularzation_update(model, args):
     sumc = args.sum_channel
     for layer in model.modules():
         if isinstance(layer, nn.BatchNorm2d):
-            layer.weight.grad.data.add(2.0 * torch.sign(layer.weight.data)*(layer.weight.data/sumc-args.ratio))
+            layer.weight.grad.data.add(args.balance * 2.0 * torch.sign(layer.weight.data)*(layer.weight.data/sumc-args.ratio))
 
 
 def arch_train(model, args, train_loader, val_loader):
@@ -176,6 +177,7 @@ def weight_train(model, train_loader, val_loader, args):
     best_acc = 0.0
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.98)
     for i in range(args.wepoch):
         print('==>Epoch %d' % (i+1))
         print('==>Training')
@@ -209,7 +211,11 @@ def weight_train(model, train_loader, val_loader, args):
             torch.save(best_checkpoint, fname)
         print('==>Best validation accuracy', best_acc)
         # Save checkpoint
-        torch.save(model.state_dict(), os.path.join(args.outdir, 'checkpoint.pth.tar')) 
+        if (i + 1) % 10 == 0:
+            torch.save(model.state_dict(), os.path.join(args.outdir, 'checkpoint.pth.tar')) 
+        # Lr_scheduler
+        if args.lr_decay:
+            lr_scheduler.step()
 
 def main():
     args = parse_args()
