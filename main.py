@@ -13,7 +13,7 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import lib
 from lib.util import progress_bar
-
+from torch.autograd import Variable
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -109,7 +109,8 @@ def arch_train(model, args, train_loader, val_loader):
 def binary_search(model, gates, args):
     # TODO: use binary search to find the threshold for the pruning
     pos = int(len(gates) * args.ratio)
-    return gates[pos]
+    sorted_gates, index = torch.sort(gates)
+    return sorted_gates[pos]
 
 
 def prune(model, args):
@@ -135,13 +136,13 @@ def prune(model, args):
             layer.weight.data.mul_(mask)
             layer.bias.data.mul_(mask)
             pruned += mask.shape[0] - sum(mask)
-            cfg.append(torch.sum(mask).item())
+            cfg.append(int(torch.sum(mask).item()))
             cfg_mask.append(mask)
         elif isinstance(layer, nn.MaxPool2d):
             cfg.append('M')
     print('Original channel number: ',args.sum_channel)
     print(cfg)
-    print('After pruned channel number: ', sum(filter(lambda x:isinstance(x,int), cfg)))
+    print('After pruned channel number: ', sum(filter(lambda x: x!='M', cfg)))
     new_model = models.__dict__[args.model](args.num_class, cfg=cfg)
     logfile = os.path.join(args.outdir, 'log.txt')
     with open(logfile, 'w') as logf:
@@ -155,18 +156,19 @@ def validation(model, val_loader, criterion, Use_Cuda):
     test_loss = 0.0
     correct = 0
     total = 0
-    for batchid, (data, target) in enumerate(val_loader):
-        if Use_Cuda:
-            data, target = data.cuda(), target.cuda()
-        output = model(data)
-        loss = criterion(output, target)
-        test_loss += loss
-        _, predicted = output.max(1)
-        total += target.size(0)
-        correct += predicted.eq(target).sum().item()
-        avg_acc = correct / total
-        avg_loss = test_loss / (batchid + 1)
-        progress_bar(batchid, len(val_loader), 'Loss: %.3f | Acc: %.3f' % (avg_loss, avg_acc))
+    with torch.no_grad():
+        for batchid, (data, target) in enumerate(val_loader):
+            if Use_Cuda:
+                data, target = data.cuda(), target.cuda()
+            output = model(data)
+            loss = criterion(output, target)
+            test_loss += loss
+            _, predicted = output.max(1)
+            total += target.size(0)
+            correct += predicted.eq(target).sum().item()
+            avg_acc = correct / total
+            avg_loss = test_loss / (batchid + 1)
+            progress_bar(batchid, len(val_loader), 'Loss: %.3f | Acc: %.3f' % (avg_loss, avg_acc))
     return correct/total
 
 
@@ -220,6 +222,8 @@ def main():
         model.cuda()
     arch_train(model, args, train_loader, val_loader)
     new_model = prune(model, args)
+    if args.Use_Cuda:
+        new_model.cuda()
     weight_train(new_model, train_loader, val_loader, args)
     
 if __name__ == '__main__':
