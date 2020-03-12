@@ -214,7 +214,7 @@ def weight_train(model, train_loader, val_loader, args):
     best_acc = 0.0
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.98)
+    lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.98)
     for i in range(args.wepoch):
         print('==>Epoch %d' % (i+1))
         print('==>Training')
