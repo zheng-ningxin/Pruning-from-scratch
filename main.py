@@ -1,6 +1,7 @@
 #!/bin/env python 
 import os
 import sys
+import copy
 import torch
 import models
 import argparse
@@ -14,6 +15,8 @@ import torchvision.transforms as transforms
 import lib
 from lib.util import progress_bar
 from torch.autograd import Variable
+import thop
+from thop import profile
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -107,14 +110,48 @@ def arch_train(model, args, train_loader, val_loader):
             progress_bar(batchid, len(train_loader), 'Loss: %.3f | Acc: %.3f'% (avg_loss, acc))
         
             
-def binary_search(model, gates, args):
+def binary_search(model, gates, args, data_loader):
+    # Get single batch data to profile the flops of the model 
+    model = copy.deepcopy(model).cpu()
+    data, target = next(iter(data_loader))
+    ori_macs, ori_params = profile(model, inputs=(data,))
+    #pos = min(int(len(gates) * args.ratio), len(gates)-1)
+    sorted_gates, _ = torch.sort(gates)
     # TODO: use binary search to find the threshold for the pruning
-    pos = int(len(gates) * args.ratio)
-    sorted_gates, index = torch.sort(gates)
-    return sorted_gates[pos]
+    lpos, rpos = 0, len(sorted_gates) - 1
+    input = torch.randn((args.batchsize, 3))
+    eps = 1
+    macs, params = None, None
+    while lpos < rpos:
+        midpos = int((lpos + rpos) / 2)
+        cur_thres = sorted_gates[midpos]
+        cfg = [] 
+        for layer in model.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                weight_copy = layer.weight.data.abs().clone()
+                mask = weight_copy.gt(cur_thres)
+                cfg.append(int(torch.sum(mask).item()))
+            elif isinstance(layer, nn.MaxPool2d):
+                cfg.append('M')
+        pruned_model = models.__dict__[args.model](args.num_class, cfg=cfg)
+        pruned_model(data)
+        macs, params = profile(pruned_model, inputs=(data,))
+        if abs(macs - ori_macs * args.ratio) < eps:
+            lpos = midpos
+            break
+        elif macs > ori_macs * args.ratio:
+            lpos = midpos + 1
+        else: 
+            #macs < ori_macs * args.ratio:
+            rpos = midpos - 1
+    print('==>Original Model:')
+    print('  Flops: {}G  Parameters: {}M'.format(ori_macs/(10**9), ori_params/(10**6)))
+    print('==>Pruned Model:')
+    print('  Flops: {}G  Parameters: {}M'.format(macs/(10**9), params/(10**6)))
+    return sorted_gates[lpos]
 
 
-def prune(model, args):
+def prune(model, args, data_loader):
     if not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
     print('Pruning the network according to the architecture parameters.')
@@ -128,7 +165,7 @@ def prune(model, args):
             nchannel = layer.weight.data.shape[0]
             gates[index:index+nchannel] = layer.weight.data.abs().clone()
             index += nchannel
-    threshold = binary_search(model, gates, args)
+    threshold = binary_search(model, gates, args, data_loader)
     for lid, layer in enumerate(model.modules()):
         if isinstance(layer, nn.BatchNorm2d):
             weight_copy = layer.weight.data.abs().clone()
@@ -227,7 +264,7 @@ def main():
     if args.Use_Cuda:
         model.cuda()
     arch_train(model, args, train_loader, val_loader)
-    new_model = prune(model, args)
+    new_model = prune(model, args, train_loader)
     if args.Use_Cuda:
         new_model.cuda()
     weight_train(new_model, train_loader, val_loader, args)
