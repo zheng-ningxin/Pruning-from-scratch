@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate for weight training.')
     parser.add_argument('--lr_decay', action='store_true', default=False, help='If use the learning rate decay.')
     parser.add_argument('--balance', type=float, default=0.5, help='The balance constant of the sparsity regularization.')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay (default 1e-4).')
     return parser.parse_args()
 
 
@@ -213,8 +214,9 @@ def validation(model, val_loader, criterion, Use_Cuda):
 def weight_train(model, train_loader, val_loader, args):
     best_acc = 0.0
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.98)
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    #lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [int(args.wepoch*0.5), int(args.wepoch*0.75)], gamma=0.1)
     for i in range(args.wepoch):
         print('==>Epoch %d' % (i+1))
         print('==>Training')
